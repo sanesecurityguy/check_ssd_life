@@ -1,0 +1,266 @@
+#!/bin/bash
+
+# The variables in this array are the models of ATA SSD's that we will search for and make checks on
+# This is the only array for which the order matters
+# Sometimes, a brand will have several model families and even specific models that we have to distinguish between, like Kingston. The order of this array determines which search strings in the `identifier` associative array are searched first. That means that more specific identifiers should be searched first, and more generic identifiers should be searched last. For example, kingston_shpm2280p2 has the most specific identifier among Kingston models, so it should be the first Kingston model in the `models` array. Meanwhile, kingston_phison models sometimes say "Device Model: SATA SSD" in their SMART information section, and kingston_sata models always say "Device Model: SATA SSD", but we use the more specific identifier "Phison" for kingston_phison models, and the more generic identifier "SATA SSD" for kingston_sata models. Therefore, kingston_phison MUST BE before kingston_sata in the `models` array.
+models=(intel samsung supermicro siliconmotion innodisk kingston_shpm2280p2 kingston_sandforce kingston_ssdnow kingston_phison kingston_sata)
+
+# The variables in this associative array are strings that `grep` searches for in the "Device Model:" and "Model Family:" lines of the SMART information section. These search strings are used to identify what model of ATA SSD is being checked.
+# The order of this array does not matter
+declare -A identifier=(
+    [intel]="intel"
+    [samsung]="samsung"
+    [supermicro]="supermicro"
+    [siliconmotion]="SiliconMotion"
+    [innodisk]="SATADOM\|innodisk"
+    [kingston_sandforce]="SandForce"
+    [kingston_ssdnow]="SSDNow"
+    [kingston_phison]="Phison"
+    [kingston_sata]="SATA SSD"
+    [kingston_shpm2280p2]="Kingston SHPM2280P2"
+)
+
+# The variables in this associative array are the SMART attributes chosen to be suitable measures of that model's ATA SSD life
+# If the chosen SMART attribute is not readable by `smartctl`, then mark that model's chosen attribute as "not_readable". "not_readable" attributes require custom checks using custom tools, like how iSMART is used to read the "Health" attribute on Innodisk ATA SSD's.
+# The order of this array does not matter
+declare -A attribute=(
+    [intel]=Media_Wearout_Indicator # See https://download.intel.com/newsroom/kits/ssd/pdfs/Intel_SSD_520_Product_Spec_325968.pdf and https://www.solidigm.com/support-page/product-doc-cert/ka-00033.html for why Media_Wearout_Indicator was chosen as a suitable measure of ATA SSD life used
+    [samsung]=Wear_Leveling_Count # See https://download.semiconductor.samsung.com/resources/others/SSD_Application_Note_SMART_final.pdf for why Wear_Leveling_Count was chosen as a suitable measure of ATA SSD life used
+    [supermicro]=Available_Reservd_Space # Undocumented; the raw value of Available_Reservd_Space turns out to be a suitable measure of ATA SSD life
+    [siliconmotion]=Remaining_Lifetime_Perc
+    [innodisk]=not_readable # Innodisk has a proprietary "Health" SMART attribute that isn't publicly documented. Documentation is provided on request with the iSMART utility. `smartctl` can see this attribute, but cannot read its name and value, so a custom check using Innodisk's iSMART utility is needed.
+    [kingston_sandforce]=SSD_Life_Left
+    [kingston_ssdnow]=SSD_Life_Left
+    [kingston_phison]=SSD_Life_Left
+    [kingston_sata]=Temperature_Celsius # Totally undocumented; there is a lack of model information from `smartctl` to find any documentation about this model's SMART attributes. I am merely guessing that "Temperature_Celsius" is actually "SSD_Life_Left".
+    [kingston_shpm2280p2]="231 Temperature_Celsius" # SMART attribute 231 is documented to be "SSD_Life_Left" according to https://media.kingston.com/support/downloads/MKP_521.1_Predator_SMART_attribute.pdf, but `smartctl` reads it as "Temperature_Celsius". We include the attribute number in order to differentiate it from "194 Temperature_Celsius".
+)
+
+# The variables in this associative array are the selected values we will check on the chosen SMART attributes
+# worst: Compare the WORST value to the THRESH value
+# raw: Compare the RAW_VALUE to zero
+# norm: Compare the normalized VALUE to the THRESH value. Generally, I recommend using the WORST value instead, but this script supports the normalized VALUE anyway.
+# not_readable: If the model's chosen attribute's value isn't readable by `smartctl`, then please mark it as "not_readable" in this array and write a custom check for it using a custom tool
+# The order of this array does not matter
+declare -A value=(
+    [intel]=worst
+    [samsung]=worst
+    [supermicro]=raw
+    [siliconmotion]=raw
+    [innodisk]=not_readable
+    [kingston_sandforce]=worst
+    [kingston_ssdnow]=raw # Undocumented; the raw value is the normalized value, and vice versa
+    [kingston_phison]=raw # Undocumented; the normalized and worst values of SSD_Life_Left are inconsistent across different models, but the raw value is more consistent
+    [kingston_sata]=raw # Totally undocumented because of the lack of model information; this is merely an intelligent guess
+    [kingston_shpm2280p2]=raw # Undocumented; the raw value is the normalized value, and vice versa
+)
+
+# Function to display the help message
+help-message () {
+    echo "Usage: check_ssd_life [-d /path/to/ssd]"
+    echo "                      [-w warning_level]"
+    echo "                      [-c critical_level]"
+    echo "                      [-t /path/to/custom_tool]"
+    echo
+    echo "[-d /path/to/ssd] is required, while the rest are optional."
+    echo
+    echo "warning_level and critical_level can be integers with or without the % sign."
+    echo "Default warning_level is 80%."
+    echo "Default critical_level is 90%."
+    echo
+    echo "[-t /path/to/custom_tool] is used when smartctl is not sufficient to check an ATA SSD's life used, and a custom check using a custom tool is necessary."
+    echo "For more information about custom checks with custom tools, read the README.md file."
+    echo
+    echo "If you're checking an ATA SSD, make sure that the smartmontools package is updated to the latest version to ensure compatibility with this script."
+    echo
+    echo "Sample usage:"
+    echo "              check_ssd_life -d /dev/sda"
+    echo "              check_ssd_life -d /dev/nvme0 -w 50"
+    echo "              check_ssd_life -w 50% -c 80% -t /path/to/iSMART_64 -d /dev/sdb"
+    echo
+}
+
+while getopts ":d:w:c:t:" option; do
+    case $option in
+        (d)
+            drive=$OPTARG;;
+        (w)
+            warning_level=$(echo $OPTARG | sed 's/%//');;
+        (c)
+            critical_level=$(echo $OPTARG | sed 's/%//');;
+        (t)
+            custom_tool=$OPTARG;;
+        (*)
+            help-message
+            exit 3;;
+    esac
+done
+
+# This section uses bash Parameter Expansion
+: ${drive:?"No path to SSD given. See 'check_ssd_life -h' for usage information."} # Throw this error message if the -d argument is null or not set
+: ${warning_level:=80} # If the -w argument is null or not set, use 80% as the default warning level
+: ${critical_level:=90} # If the -c argument is null or not set, use 90% as the default critical level
+
+function exit_with_life_used () {
+    if [ $round_percentage_used -ge $critical_level ]; then
+        echo "CRITICAL: SSD life used is at $round_percentage_used%"
+        exit 2
+    elif [ $round_percentage_used -ge $warning_level ]; then
+        echo "WARNING: SSD life used is at $round_percentage_used%"
+        exit 1
+    elif [ $round_percentage_used -lt $warning_level ] && [ $round_percentage_used -ge 0 ]; then
+        echo "OK: SSD life used is at $round_percentage_used%"
+        exit 0
+    else
+        echo "UNKNOWN: SSD life used is unknown. Something went wrong with the check."
+        exit 3
+    fi
+}
+
+# Check if the script is being run as root
+if [ $(whoami) != "root" ] ; then
+    echo "CONFIGURATION ERROR: This script needs to be run as root"
+    exit 3
+fi
+
+# Check if `smartctl` is installed and in the $PATH
+if smartctl -V | grep -q "smartctl: command not found"; then
+    echo "HOST ERROR: smartctl was not found. smartctl is necessary for check_ssd_life to work."
+    exit 3
+fi
+
+smartctl_info=$(smartctl -i $drive)
+
+# Check if the device exists
+if echo "$smartctl_info" | grep -q "failed: No such device\|Unable to detect device type"; then
+    echo "ARGUMENT ERROR: $drive either does not exist, or is not a full device path like /dev/sda or /dev/nvme0"
+    exit 3
+fi
+
+# If the device is an NVMe SSD, then do the check here using the Percentage Used NVMe SMART attribute
+if echo $drive | grep -q "/dev/nvme[0-9]"; then # `smartctl -c` can take a while to run on ATA SSD's, so we try to avoid running it on them unnecessarily here
+    # Some NVMe's show no NVMe identifiers with `smartctl -i`, so we include the info from `smartctl -c`
+    if smartctl -ic $drive | grep -q "Total NVM Capacity:\|NVMe Version:\|Unallocated NVM Capacity\|Optional NVM Commands"; then
+        round_percentage_used=$(smartctl -A $drive | grep "Percentage Used:" | awk '{print $3}' | sed 's/%//')
+        exit_with_life_used
+    fi
+fi
+
+# If the device is an HDD, exit with a suitable error message
+if echo "$smartctl_info" | grep "Rotation Rate:" | grep -qi "rpm"; then
+    echo "ARGUMENT ERROR: $drive is an HDD, not an SSD."
+    exit 3
+fi
+
+# If the device is not an ATA SSD, then exit with a suitable error message
+if ! echo "$smartctl_info" | grep -q "Rotation Rate:    Solid State Device"; then
+    echo "ARGUMENT ERROR: $drive seems to be something other than an SSD."
+    exit 3
+fi
+
+# Sometimes an ATA SSD will pass the SMART overall health self-assessment test, but have failing or failed SMART attributes according to `smartctl`. If a SMART attribute is failing now or has failed in the past, we want to be notified of it regardless of what the percentage of life used is.
+smart_attributes=$(smartctl -A $drive)
+if echo "$smart_attributes" | grep -q "FAILING_NOW\|In_the_past"; then
+    echo "CRITICAL: At least one SMART attribute in $drive has failed"
+    exit 2
+fi
+
+# Find out which model of ATA SSD is being checked so we know what the chosen SMART attribute is, or exit with a suitable error message if it is none of the models for which this script is designed for
+device_model=$(echo "$smartctl_info" | grep "Device Model:\|Model Family:")
+detected_model=""
+
+for model in ${models[*]}; do
+    if echo "$device_model" | grep -qi "${identifier[$model]}"; then
+        detected_model=$model
+        break
+    fi
+done
+
+if [ "$detected_model" == "" ]; then
+    echo "ARGUMENT ERROR: ATA SSD model was not detected. $drive is probably an ATA SSD model that this script is not designed for. Find out what SMART attribute we should use for percentage of life used checks on this model of ATA SSD and add it to this script."
+    exit 3
+fi
+
+# This is our function to invert ATA SSD life measurements. Unlike the NVMe "Percentage Used" attribute that goes from 0% to 100% of life used, ATA SSD SMART attributes typically go from 100% to 0% of life left. This is confusing as a percentage of 10% can be interpreted as "10% of life used" or "10% life left", depending on whether we're looking at an ATA SSD or an NVMe SSD. To standardize both ATA and NVMe life percentages to be "% of life used", we use this function.
+# $ARG1 should be the SMART attribute's value (worst value, raw value, or normalized value), while $ARG2 should be the threshold value to compare it against
+function invert_percentage () {
+    local inverted_value=$(echo "100 - $1" | bc -l)
+    local inverted_thresh=$(echo "100 - $2" | bc -l)
+    local decimal_used=$(echo "$inverted_value / $inverted_thresh" | bc -l)
+    local percentage_used=$(echo "$decimal_used * 100" | bc -l)
+    round_percentage_used=$(echo "scale=0; $percentage_used / 1" | bc -l) # "scale=0" rounds down to the whole number. Dividing by 1 is necessary to force `bc` to perform the rounding operation. Multiplying by 1 or adding/subtracting 0 does not perform the rounding operation.
+}
+
+function get_worst_percentage () {
+    local worst_value=$(echo "$chosen_attribute" | awk '{print $5}')
+    local thresh_value=$(echo "$chosen_attribute" | awk '{print $6}')
+    invert_percentage "$worst_value" "$thresh_value"
+}
+
+function get_raw_percentage () {
+    local raw_value=$(echo "$chosen_attribute" | awk '{print $10}')
+    invert_percentage "$raw_value" 0
+}
+
+function get_norm_percentage () {
+    local norm_value=$(echo "$chosen_attribute" | awk '{print $4}')
+    local thresh_value=$(echo "$chosen_attribute" | awk '{print $6}')
+    invert_percentage "$norm_value" "$thresh_value"
+}
+
+######################### CUSTOM LIFE USED CHECKS START HERE #########################
+
+# Custom Life Used check for Innodisk ATA SSD's using Innodisk iSMART
+if [ "$detected_model" == "innodisk" ]; then
+
+    # Check if Innodisk's iSMART tool is available.
+    if [ "$custom_tool" == "" ]; then
+        echo "ARGUMENT ERROR: Checking an Innodisk ATA SSD, but no path to iSMART_64 was provided with the -t option. iSMART is necessary for check_ssd_life to work on Innodisk ATA SSD's."
+        exit 3
+    fi
+    if ! [ -f "$custom_tool" ] ; then
+        echo "HOST ERROR: Checking an Innodisk ATA SSD, but iSMART_64 was not found at $custom_tool. Is $custom_tool the *full path* to an executable file, or just the path to a directory? The full path to an executable file is needed."
+        exit 3
+    fi
+
+    # Check if iSMART_64 is executable
+    if ! [ -x "$custom_tool" ] ; then
+        echo "HOST ERROR: iSMART_64 was found at $custom_tool, but it is not executable."
+        exit 3
+    fi
+
+    ismart_data=$("$custom_tool" -d $drive | grep "Health")
+    health_remaining=$(echo "$ismart_data" | awk '{print $3}')
+    invert_percentage "$health_remaining" 0
+    exit_with_life_used
+
+fi
+
+######################### CUSTOM LIFE USED CHECKS END HERE #########################
+
+# All custom checks using custom tools should be programmed to exit in the code section above. If they don't, we catch them here and throw appropriate errors.
+if [ "${attribute[$detected_model]}" == "not_readable" ] || [ "${value[$detected_model]}" == "not_readable" ]; then
+    echo "SCRIPT ERROR: The chosen SMART attribute is not readable by smartctl. Please add a custom Life Used check for this model of ATA SSD using a different tool. You can study this script's usage of iSMART on Innodisk ATA SSD's to learn how to create a custom Life Used check."
+    exit 3
+elif [ "${attribute[$detected_model]}" == "" ]; then
+    echo "SCRIPT ERROR: No SMART attribute chosen for the detected ATA SSD model, $detected_model."
+    exit 3
+elif [ "${value[$detected_model]}" == "" ]; then
+    echo "SCRIPT ERROR: No value selected for the chosen SMART attribute, ${attribute[$detected_model]}. Please select worst value, raw value, normalized value, or not_readable."
+    exit 3
+fi
+
+# If no custom tool is necessary, and no SMART attributes have failed according to `smartctl`, we finally use `smartctl` to check the ATA SSD's percentage of life used
+chosen_attribute=$(echo "$smart_attributes" | grep "${attribute[$detected_model]}")
+if [ "${value[$detected_model]}" == "worst" ]; then
+    get_worst_percentage
+elif [ "${value[$detected_model]}" == "raw" ]; then
+    get_raw_percentage
+elif [ "${value[$detected_model]}" == "norm" ]; then
+    get_norm_percentage
+else
+    echo "SCRIPT ERROR: The script doesn't know what value to use for the chosen SMART attribute, ${attribute[$detected_model]}. Please select worst value, raw value, or normalized value."
+    exit 3
+fi
+
+exit_with_life_used
