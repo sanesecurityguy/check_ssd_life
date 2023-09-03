@@ -56,5 +56,5 @@ In my testing, placing only the `iSMART_64` binary in the host, making it execut
 
 There are minor, seemingly insignificant errors when not including the configuration files that are supposed to come with it. If running just the `iSMART_64` binary by itself does not show the "Health" attribute, and there are errors shown because of the missing config files, try adding them into the same directory that the `iSMART_64` binary is in and see if that gets the "Health" attribute to show up.
 
-### Comparison to alternatives
+### Alternatives
 Thomas Krenn's [check_smart_attributes](https://github.com/thomas-krenn/check_smart_attributes) tool is a more comprehensive tool that performs a similar function. Being more comprehensive, however, means it also has functions that aren't related to measuring an SSD's lifespan. check_ssd_life was created for the sole purpose of measuring an SSD's life used, and standardizing ATA SSD measurements _"the NVMe way"_ to make the data easier to organize, along with lots of error checking for when something (inevitably) goes wrong.
